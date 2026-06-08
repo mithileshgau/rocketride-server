@@ -2,7 +2,7 @@ name: Discord Discussion Notification
 
 on:
   discussion:
-    types: [created, edited, answered, unanswered, labeled, unlabeled, category_changed]
+    types: [created, edited, closed, reopened, answered, unanswered, labeled, unlabeled, category_changed]
   discussion_comment:
     types: [created]
 
@@ -153,7 +153,8 @@ jobs:
                 {name: "Category", value: $category, inline: true},
                 {name: "Comments", value: $comments, inline: true},
                 {name: "Labels",   value: $labels,   inline: true},
-                {name: "Repo",     value: $repo,     inline: true}
+                {name: "Repo",     value: $repo,     inline: true},
+                {name: "💬 Reply", value: ("[Reply on GitHub →](" + $url + ")"), inline: false}
               ]
             }]}')
 
@@ -219,11 +220,14 @@ jobs:
           BASE="${BASE%/}"
 
           # ── Post or patch ────────────────────────────────────────────────
+          # Forum threads: the starter message id equals the thread id, so we
+          # pass ?thread_id=$DISCORD_MSG_ID on every edit/delete to target the
+          # message inside its thread (webhook edits in a thread require it).
           if [ -n "$DISCORD_MSG_ID" ]; then
             PATCH_BODY=$(discord_curl -X PATCH \
               -H "Content-Type: application/json" \
               -d "$PAYLOAD" \
-              "$BASE/messages/$DISCORD_MSG_ID") || true
+              "$BASE/messages/$DISCORD_MSG_ID?thread_id=$DISCORD_MSG_ID") || true
             PATCH_STATUS=$(cat "$DISCORD_STATUS_FILE")
             echo "PATCH status: $PATCH_STATUS"
 
@@ -239,12 +243,20 @@ jobs:
           fi
 
           if [ -z "$DISCORD_MSG_ID" ]; then
+            # Forum channels require thread_name on the initial post: it spawns a
+            # new forum thread (one per discussion) with this embed as the starter
+            # message. thread_name is capped at 100 chars by Discord. Only the POST
+            # carries thread_name — edits must not include it.
+            POST_PAYLOAD=$(echo "$PAYLOAD" | jq \
+              --arg tn "#$NUMBER $TITLE" \
+              '. + {thread_name: ($tn | if length > 100 then .[:100] else . end)}')
+
             # --no-retry-5xx makes POST at-most-once per the discord-helper
             # contract: only 429 is safe to retry (request guaranteed rejected);
             # transient 5xx or no-response could each create a duplicate message.
             if ! RESPONSE=$(discord_curl --no-retry-5xx -X POST \
               -H "Content-Type: application/json" \
-              -d "$PAYLOAD" \
+              -d "$POST_PAYLOAD" \
               "$BASE?wait=true"); then
               echo "::error::Discord POST failed (status $(cat "$DISCORD_STATUS_FILE")) after retries"
               exit 1
@@ -255,11 +267,12 @@ jobs:
             EXISTING_MARKER=$(find_marker)
 
             if [ -n "$EXISTING_MARKER" ] && [ "$EXISTING_MARKER" != "null" ]; then
-              # Another run won the race — delete our duplicate message, use theirs
-              discord_curl -X DELETE "$BASE/messages/$NEW_MSG_ID" > /dev/null || true
+              # Another run won the race — delete our duplicate thread, use theirs.
+              # NEW_MSG_ID is the starter message == thread id, so thread_id targets it.
+              discord_curl -X DELETE "$BASE/messages/$NEW_MSG_ID?thread_id=$NEW_MSG_ID" > /dev/null || true
               DISCORD_MSG_ID=$(echo "$EXISTING_MARKER" | jq -r '.body' | grep -o 'discord-msg-id:[0-9]*' | cut -d':' -f2)
               discord_curl -X PATCH -H "Content-Type: application/json" -d "$PAYLOAD" \
-                "$BASE/messages/$DISCORD_MSG_ID" > /dev/null || true
+                "$BASE/messages/$DISCORD_MSG_ID?thread_id=$DISCORD_MSG_ID" > /dev/null || true
             else
               DISCORD_MSG_ID="$NEW_MSG_ID"
               gh api graphql \
